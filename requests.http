@@ -1,0 +1,1555 @@
+### Вариант 16. Согласование переводов — лаба 4: аутентификация и авторизация.
+### Выполняйте запросы сверху вниз (или «Run All Requests in File»): id и CSRF-токен сохраняются в переменные.
+### Запросы с «✗» — негативные проверки, они ДОЛЖНЫ вернуть ошибку.
+### Пользователь запроса задаётся заголовком Authorization: Basic <email> <пароль>.
+### Администратор admin@demo.local / Admin#2024 создаётся миграцией V3.
+
+### ================= 0. Аутентификация и CSRF =================
+### HTTP Basic: email и пароль в каждом запросе. Для POST / PATCH / DELETE нужен CSRF-токен: GET /api/auth/csrf ставит cookie XSRF-TOKEN и возвращает токен, его передаём в заголовке X-XSRF-TOKEN.
+
+### Получить CSRF-токен
+< {%
+    client.global.set("runId", Date.now().toString());
+    const runId = client.global.get("runId");
+    client.global.set("adminEmail", "admin@demo.local");
+    client.global.set("adminPassword", "Admin#2024");
+    client.global.set("seedEditorEmail", "anna.editor@demo.local");
+    client.global.set("seedEditorPassword", "Editor#2024");
+    client.global.set("userPassword", "Str0ng#Pass2024");
+    client.global.set("editorEmail", "anna." + runId + "@example.com");
+    client.global.set("editor2Email", "dmitry." + runId + "@example.com");
+    client.global.set("translatorEmail", "boris." + runId + "@example.com");
+    client.global.set("translator2Email", "vera." + runId + "@example.com");
+    client.global.set("guestEmail", "guest." + runId + "@example.com");
+    client.global.set("guestPassword", "Str0ng#Pass2024");
+%}
+GET https://localhost:8443/api/auth/csrf
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Заголовок X-XSRF-TOKEN", () => client.assert(body.headerName === "X-XSRF-TOKEN"));
+    client.test("Токен выдан", () => client.assert(!!body.token));
+    client.global.set("csrfToken", body.token);
+%}
+
+### ✗ Запрос без логина → 401
+GET https://localhost:8443/api/translation-projects
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+    const body = response.body;
+    client.test("Понятное сообщение", () => client.assert(body.message.includes("аутентификация")));
+%}
+
+### ✗ Неверный пароль → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{adminEmail}} Wrong#Password1
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+    const body = response.body;
+    client.test("Без подробностей, какой именно email", () => client.assert(!body.message.includes("admin")));
+%}
+
+### ✗ Несуществующий пользователь → 401 (такой же ответ)
+GET https://localhost:8443/api/auth/me
+Authorization: Basic nobody.{{runId}}@example.com Wrong#Password1
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### Вход администратора (из миграции)
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Роль ADMIN", () => client.assert(body.role === "ADMIN"));
+    client.global.set("adminId", body.id);
+%}
+
+### Вход тестового редактора (из миграции)
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{seedEditorEmail}} {{seedEditorPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Роль EDITOR", () => client.assert(body.role === "EDITOR"));
+%}
+
+### Тестовые проекты из миграции
+GET https://localhost:8443/api/translation-projects
+Authorization: Basic {{seedEditorEmail}} {{seedEditorPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Массив", () => client.assert(Array.isArray(body)));
+%}
+
+### ✗ Регистрация без CSRF-токена → 403
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+
+{
+  "name": "Без токена",
+  "email": "nocsrf.{{runId}}@example.com",
+  "password": "{{userPassword}}"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+    const body = response.body;
+    client.test("Сообщение про CSRF", () => client.assert(body.message.includes("CSRF")));
+%}
+
+### ✗ Поддельный CSRF-токен → 403
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: fake-token
+
+{
+  "name": "Подделка",
+  "email": "fake.{{runId}}@example.com",
+  "password": "{{userPassword}}"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ================= 1. Регистрация и пользователи =================
+### Переводчики регистрируются сами (роль всегда TRANSLATOR), редакторов создаёт администратор.
+
+### Борис регистрируется
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Борис",
+  "email": "{{translatorEmail}}",
+  "password": "{{userPassword}}"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.test("Роль TRANSLATOR", () => client.assert(body.role === "TRANSLATOR"));
+    client.test("Хеш пароля не отдаётся", () => client.assert(body.passwordHash === undefined && body.password === undefined));
+    client.global.set("translatorId", body.id);
+%}
+
+### Вера регистрируется и пытается стать ADMIN
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Вера Лингвистова",
+  "email": "{{translator2Email}}",
+  "password": "{{userPassword}}",
+  "role": "ADMIN"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.test("Роль всё равно TRANSLATOR", () => client.assert(body.role === "TRANSLATOR"));
+    client.global.set("translator2Id", body.id);
+%}
+
+### Гость регистрируется
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Гость",
+  "email": "{{guestEmail}}",
+  "password": "{{guestPassword}}"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("tmpUserId", body.id);
+%}
+
+### ✗ Email уже занят → 409
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Двойник",
+  "email": "{{translatorEmail}}",
+  "password": "{{userPassword}}"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Слабый пароль → 400
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Слабый",
+  "email": "weak.{{runId}}@example.com",
+  "password": "12345678"
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+    const body = response.body;
+    client.test("Перечислены требования", () => client.assert(body.message.includes("заглавная")));
+%}
+
+### ✗ Пароль содержит email → 400
+POST https://localhost:8443/api/auth/register
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Иван",
+  "email": "ivan.{{runId}}@example.com",
+  "password": "Ivan.{{runId}}#A"
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+%}
+
+### ✗ Переводчик создаёт пользователя → 403
+POST https://localhost:8443/api/users
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Мой админ",
+  "email": "evil.{{runId}}@example.com",
+  "password": "{{userPassword}}",
+  "role": "ADMIN"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Администратор создаёт редактора Анну
+POST https://localhost:8443/api/users
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Анна Редакторова",
+  "email": "{{editorEmail}}",
+  "password": "{{userPassword}}",
+  "role": "EDITOR"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.test("Роль EDITOR", () => client.assert(body.role === "EDITOR"));
+    client.global.set("editorId", body.id);
+%}
+
+### Администратор создаёт редактора Дмитрия
+POST https://localhost:8443/api/users
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Дмитрий",
+  "email": "{{editor2Email}}",
+  "password": "{{userPassword}}",
+  "role": "EDITOR"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("editor2Id", body.id);
+%}
+
+### Борис: кто я
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Это Борис", () => client.assert(body.id == client.global.get("translatorId")));
+%}
+
+### ✗ Переводчик смотрит список пользователей → 403
+GET https://localhost:8443/api/users
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Борис смотрит карточку Веры → 403
+GET https://localhost:8443/api/users/{{translator2Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Борис меняет своё имя
+PATCH https://localhost:8443/api/users/{{translatorId}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Борис Переводов"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Имя изменено", () => client.assert(body.name === "Борис Переводов"));
+%}
+
+### ✗ Вера меняет имя Борису → 403
+PATCH https://localhost:8443/api/users/{{translatorId}}
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Взломан"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Вера выдаёт себе роль ADMIN → 403
+PATCH https://localhost:8443/api/users/{{translator2Id}}/role
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "role": "ADMIN"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Список пользователей (администратор)
+GET https://localhost:8443/api/users
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Массив", () => client.assert(Array.isArray(body)));
+%}
+
+### Пользователь по id (администратор)
+GET https://localhost:8443/api/users/{{editorId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Анна", () => client.assert(body.email === client.global.get("editorEmail")));
+%}
+
+### ================= 2. Состояние учётной записи =================
+### После 5 неверных паролей подряд учётная запись блокируется на 15 минут. Администратор может заблокировать пользователя и снять любую блокировку.
+
+### Гость меняет пароль
+POST https://localhost:8443/api/auth/password
+Authorization: Basic {{guestEmail}} {{guestPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "currentPassword": "{{guestPassword}}",
+  "newPassword": "N3w#Guest{{runId}}"
+}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+    client.global.set("guestPassword", "N3w#Guest" + client.global.get("runId"));
+%}
+
+### ✗ Неверный текущий пароль → 400
+POST https://localhost:8443/api/auth/password
+Authorization: Basic {{guestEmail}} {{guestPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "currentPassword": "Wrong#Password1",
+  "newPassword": "An0ther#Pass"
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+%}
+
+### ✗ Подбор пароля гостя, попытка 1 → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} Guess#1pass
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Подбор пароля гостя, попытка 2 → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} Guess#2pass
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Подбор пароля гостя, попытка 3 → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} Guess#3pass
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Подбор пароля гостя, попытка 4 → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} Guess#4pass
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Подбор пароля гостя, попытка 5 → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} Guess#5pass
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Верный пароль, но учётная запись заблокирована → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} {{guestPassword}}
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### Администратор снимает блокировку
+POST https://localhost:8443/api/users/{{tmpUserId}}/unblock
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("ACTIVE", () => client.assert(body.status === "ACTIVE"));
+%}
+
+### Гость снова входит
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} {{guestPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Администратор блокирует гостя
+POST https://localhost:8443/api/users/{{tmpUserId}}/block
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("BLOCKED", () => client.assert(body.status === "BLOCKED"));
+%}
+
+### ✗ Заблокированный гость → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{guestEmail}} {{guestPassword}}
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Администратор блокирует сам себя → 409
+POST https://localhost:8443/api/users/{{adminId}}/block
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Удалить гостя
+DELETE https://localhost:8443/api/users/{{tmpUserId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### Удалённый пользователь → 404
+GET https://localhost:8443/api/users/{{tmpUserId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 404", () => client.assert(response.status === 404, "Ожидался 404, получен " + response.status));
+%}
+
+### ================= 3. Проекты — CRUD =================
+### Создавать проекты может редактор, он же становится владельцем. Менять проект может только владелец.
+
+### ✗ Переводчик создаёт проект → 403
+POST https://localhost:8443/api/translation-projects
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Свой проект",
+  "targetLanguage": "en"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Статус напрямую → 400
+POST https://localhost:8443/api/translation-projects
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Хитрый проект",
+  "targetLanguage": "en",
+  "status": "COMPLETED"
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+%}
+
+### Анна создаёт проект
+POST https://localhost:8443/api/translation-projects
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Локализация сайта {{runId}}",
+  "targetLanguage": "en"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.test("Владелец — Анна", () => client.assert(body.ownerId == client.global.get("editorId")));
+    client.test("DRAFT", () => client.assert(body.status === "DRAFT"));
+    client.global.set("projectId", body.id);
+%}
+
+### Анна создаёт пустой проект
+POST https://localhost:8443/api/translation-projects
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Пустой проект {{runId}}",
+  "targetLanguage": "de"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("emptyProjectId", body.id);
+%}
+
+### Список проектов (переводчик может читать)
+GET https://localhost:8443/api/translation-projects
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Массив", () => client.assert(Array.isArray(body)));
+%}
+
+### Проект по id
+GET https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Анна переименовывает проект
+PATCH https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Локализация сайта v2 {{runId}}"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### ✗ Дмитрий переименовывает чужой проект → 403
+PATCH https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{editor2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Мой теперь"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ================= 4. Исходные сегменты — CRUD =================
+### Сегменты добавляет и меняет только владелец проекта.
+
+### Создать сегмент 1
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Добро пожаловать!"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("seg1Id", body.id);
+%}
+
+### Создать сегмент 2
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Корзина пуста"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("seg2Id", body.id);
+%}
+
+### ✗ Занятая позиция → 409
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Дубль",
+  "position": 1
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Дмитрий добавляет сегмент в чужой проект → 403
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{editor2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Чужой сегмент"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Переводчик добавляет сегмент → 403
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Сегмент"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Создать временный сегмент
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Временный"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("seg3Id", body.id);
+%}
+
+### Список сегментов
+GET https://localhost:8443/api/source-segments
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Сегмент по id
+GET https://localhost:8443/api/source-segments/{{seg2Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Изменить текст сегмента 2
+PATCH https://localhost:8443/api/source-segments/{{seg2Id}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "sourceText": "Ваша корзина пуста"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Удалить временный сегмент
+DELETE https://localhost:8443/api/source-segments/{{seg3Id}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### ================= 5. БО-1 Запуск проекта =================
+### Запускает только владелец.
+
+### ✗ Запуск проекта без сегментов → 409
+POST https://localhost:8443/api/translation-projects/{{emptyProjectId}}/start
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Запуск переводчиком → 403
+POST https://localhost:8443/api/translation-projects/{{projectId}}/start
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Запуск чужим редактором → 403
+POST https://localhost:8443/api/translation-projects/{{projectId}}/start
+Authorization: Basic {{editor2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Анна запускает проект
+POST https://localhost:8443/api/translation-projects/{{projectId}}/start
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("IN_PROGRESS", () => client.assert(body.status === "IN_PROGRESS"));
+%}
+
+### ✗ Повторный запуск → 409
+POST https://localhost:8443/api/translation-projects/{{projectId}}/start
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Сменить язык запущенного проекта → 409
+PATCH https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "targetLanguage": "fr"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Забрать у Анны роль редактора, пока у неё есть проекты → 409
+PATCH https://localhost:8443/api/users/{{editorId}}/role
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "role": "TRANSLATOR"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Удалить пустой проект
+DELETE https://localhost:8443/api/translation-projects/{{emptyProjectId}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### ================= 6. Переводы — CRUD =================
+### Автор перевода — тот, кто его создал. Править перевод может только автор.
+
+### Борис переводит сегмент 1
+POST https://localhost:8443/api/translations
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "segmentId": {{seg1Id}},
+  "text": "Welcome"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.test("Автор — Борис", () => client.assert(body.authorId == client.global.get("translatorId")));
+    client.global.set("t1Id", body.id);
+%}
+
+### Вера переводит сегмент 2
+POST https://localhost:8443/api/translations
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "segmentId": {{seg2Id}},
+  "text": "Cart is empty"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("t2Id", body.id);
+%}
+
+### Вера предлагает свой вариант сегмента 1
+POST https://localhost:8443/api/translations
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "segmentId": {{seg1Id}},
+  "text": "Hello there"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("t3Id", body.id);
+%}
+
+### Список переводов
+GET https://localhost:8443/api/translations
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Перевод по id
+GET https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Борис правит свой черновик
+PATCH https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "text": "Welcome!"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### ✗ Вера правит перевод Бориса → 403
+PATCH https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "text": "Испорчено"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Статус напрямую → 400
+PATCH https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "status": "APPROVED"
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+%}
+
+### ================= 7. БО-2 Отправка на согласование =================
+### Отправляет только автор.
+
+### ✗ Вера отправляет перевод Бориса → 403
+POST https://localhost:8443/api/translations/{{t1Id}}/submit
+Authorization: Basic {{translator2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Борис отправляет перевод
+POST https://localhost:8443/api/translations/{{t1Id}}/submit
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("SUBMITTED", () => client.assert(body.status === "SUBMITTED"));
+%}
+
+### ✗ Править текст на согласовании → 409
+PATCH https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "text": "Поздно"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Второй активный перевод сегмента → 409
+POST https://localhost:8443/api/translations/{{t3Id}}/submit
+Authorization: Basic {{translator2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Анна удаляет лишний черновик Веры (владелец проекта)
+DELETE https://localhost:8443/api/translations/{{t3Id}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### ================= 8. БО-3 Отклонение с замечанием =================
+### Отклоняет только редактор — владелец проекта.
+
+### ✗ Отклонение переводчиком → 403
+POST https://localhost:8443/api/translations/{{t1Id}}/reject
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "comment": "Мне не нравится"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Отклонение чужим редактором → 403
+POST https://localhost:8443/api/translations/{{t1Id}}/reject
+Authorization: Basic {{editor2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "comment": "Мне не нравится"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### ✗ Отклонение без замечания → 400
+POST https://localhost:8443/api/translations/{{t1Id}}/reject
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "comment": ""
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+%}
+
+### Анна отклоняет перевод
+POST https://localhost:8443/api/translations/{{t1Id}}/reject
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "comment": "Уберите восклицательный знак, в интерфейсе их не используем"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Перевод REJECTED", () => client.assert(body.translation.status === "REJECTED"));
+    client.test("Замечание OPEN", () => client.assert(body.comment.status === "OPEN"));
+    client.global.set("c1Id", body.comment.id);
+%}
+
+### Борис видит замечание
+GET https://localhost:8443/api/editorial-comments/{{c1Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### ================= 9. Замечания — CRUD =================
+### Замечания ведёт редактор — владелец проекта.
+
+### Анна добавляет второе замечание
+POST https://localhost:8443/api/editorial-comments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "translationId": {{t1Id}},
+  "text": "Проверьте регистр"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("c2Id", body.id);
+%}
+
+### ✗ Замечание к черновику → 409
+POST https://localhost:8443/api/editorial-comments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "translationId": {{t2Id}},
+  "text": "Рано"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Замечание от переводчика → 403
+POST https://localhost:8443/api/editorial-comments
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "translationId": {{t1Id}},
+  "text": "Тоже хочу"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Список замечаний
+GET https://localhost:8443/api/editorial-comments
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Замечание по id
+GET https://localhost:8443/api/editorial-comments/{{c2Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Анна меняет текст замечания
+PATCH https://localhost:8443/api/editorial-comments/{{c2Id}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "text": "Проверьте регистр первой буквы"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### ✗ Статус напрямую → 400
+PATCH https://localhost:8443/api/editorial-comments/{{c2Id}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "status": "RESOLVED"
+}
+
+> {%
+    client.test("HTTP 400", () => client.assert(response.status === 400, "Ожидался 400, получен " + response.status));
+%}
+
+### Анна удаляет второе замечание
+DELETE https://localhost:8443/api/editorial-comments/{{c2Id}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### ✗ Повторная отправка с открытым замечанием → 409
+POST https://localhost:8443/api/translations/{{t1Id}}/submit
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ================= 10. БО-5 Устранение замечания =================
+### Устраняет автор перевода.
+
+### ✗ Устранение не автором → 403
+POST https://localhost:8443/api/editorial-comments/{{c1Id}}/resolve
+Authorization: Basic {{translator2Email}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "translationText": "Welcome"
+}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Борис устраняет замечание
+POST https://localhost:8443/api/editorial-comments/{{c1Id}}/resolve
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "translationText": "Welcome"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("RESOLVED", () => client.assert(body.comment.status === "RESOLVED"));
+    client.test("Текст исправлен", () => client.assert(body.translation.text === "Welcome"));
+%}
+
+### ✗ Повторное устранение → 409
+POST https://localhost:8443/api/editorial-comments/{{c1Id}}/resolve
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Борис отправляет исправленный перевод
+POST https://localhost:8443/api/translations/{{t1Id}}/submit
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### ================= 11. БО-4 Утверждение перевода =================
+### Утверждает редактор — владелец проекта.
+
+### ✗ Переводчик утверждает перевод → 403
+POST https://localhost:8443/api/translations/{{t1Id}}/approve
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Анна утверждает перевод сегмента 1
+POST https://localhost:8443/api/translations/{{t1Id}}/approve
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("APPROVED", () => client.assert(body.translation.status === "APPROVED"));
+    client.test("Проект ещё в работе", () => client.assert(body.project.status === "IN_PROGRESS"));
+%}
+
+### ✗ Завершить проект рано → 409
+POST https://localhost:8443/api/translation-projects/{{projectId}}/complete
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ================= 12. БО-6 Снятие замечания и автопереход в REVIEW =================
+
+### Вера отправляет перевод сегмента 2
+POST https://localhost:8443/api/translations/{{t2Id}}/submit
+Authorization: Basic {{translator2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### Анна оставляет вопрос к переводу
+POST https://localhost:8443/api/editorial-comments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "translationId": {{t2Id}},
+  "text": "Может, «Your cart is empty»?"
+}
+
+> {%
+    client.test("HTTP 201", () => client.assert(response.status === 201, "Ожидался 201, получен " + response.status));
+    const body = response.body;
+    client.global.set("c3Id", body.id);
+%}
+
+### ✗ Утверждение при открытом замечании → 409
+POST https://localhost:8443/api/translations/{{t2Id}}/approve
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Снять замечание переводчиком → 403
+POST https://localhost:8443/api/editorial-comments/{{c3Id}}/dismiss
+Authorization: Basic {{translator2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Анна снимает замечание
+POST https://localhost:8443/api/editorial-comments/{{c3Id}}/dismiss
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Замечание снято", () => client.assert(body.status === "REJECTED"));
+%}
+
+### Анна утверждает последний сегмент → проект в REVIEW
+POST https://localhost:8443/api/translations/{{t2Id}}/approve
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("Проект в REVIEW", () => client.assert(body.project.status === "REVIEW"));
+%}
+
+### ✗ Добавить сегмент в проект на REVIEW → 409
+POST https://localhost:8443/api/source-segments
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "projectId": {{projectId}},
+  "sourceText": "Поздно"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ================= 13. БО-7 Завершение и БО-8 Архивирование =================
+
+### ✗ Завершение чужим редактором → 403
+POST https://localhost:8443/api/translation-projects/{{projectId}}/complete
+Authorization: Basic {{editor2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Анна завершает проект
+POST https://localhost:8443/api/translation-projects/{{projectId}}/complete
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("COMPLETED", () => client.assert(body.status === "COMPLETED"));
+%}
+
+### ✗ Удалить автора утверждённого перевода → 409
+DELETE https://localhost:8443/api/users/{{translatorId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Анна отправляет проект в архив
+POST https://localhost:8443/api/translation-projects/{{projectId}}/archive
+Authorization: Basic {{editorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("ARCHIVED", () => client.assert(body.status === "ARCHIVED"));
+%}
+
+### ✗ Изменить архивный проект → 409
+PATCH https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{editorEmail}} {{userPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "name": "Новое имя"
+}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### ✗ Удалить перевод из архива → 409
+DELETE https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Теперь у Анны только архивные проекты — роль можно сменить
+PATCH https://localhost:8443/api/users/{{editorId}}/role
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "role": "TRANSLATOR"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+    const body = response.body;
+    client.test("TRANSLATOR", () => client.assert(body.role === "TRANSLATOR"));
+%}
+
+### Администратор возвращает Анне роль редактора
+PATCH https://localhost:8443/api/users/{{editorId}}/role
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+Content-Type: application/json
+X-XSRF-TOKEN: {{csrfToken}}
+
+{
+  "role": "EDITOR"
+}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
+
+### ================= 14. Каскадное удаление =================
+### Администратор может удалить любой проект.
+
+### ✗ Чужой редактор удаляет проект → 403
+DELETE https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{editor2Email}} {{userPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 403", () => client.assert(response.status === 403, "Ожидался 403, получен " + response.status));
+%}
+
+### Администратор удаляет проект
+DELETE https://localhost:8443/api/translation-projects/{{projectId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### Сегмент удалён → 404
+GET https://localhost:8443/api/source-segments/{{seg1Id}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 404", () => client.assert(response.status === 404, "Ожидался 404, получен " + response.status));
+%}
+
+### Перевод удалён → 404
+GET https://localhost:8443/api/translations/{{t1Id}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 404", () => client.assert(response.status === 404, "Ожидался 404, получен " + response.status));
+%}
+
+### Замечание удалено → 404
+GET https://localhost:8443/api/editorial-comments/{{c1Id}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 404", () => client.assert(response.status === 404, "Ожидался 404, получен " + response.status));
+%}
+
+### Теперь Бориса можно удалить
+DELETE https://localhost:8443/api/users/{{translatorId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 204", () => client.assert(response.status === 204, "Ожидался 204, получен " + response.status));
+%}
+
+### ✗ Удалённый Борис не может войти → 401
+GET https://localhost:8443/api/auth/me
+Authorization: Basic {{translatorEmail}} {{userPassword}}
+
+> {%
+    client.test("HTTP 401", () => client.assert(response.status === 401, "Ожидался 401, получен " + response.status));
+%}
+
+### ✗ Администратор удаляет сам себя → 409
+DELETE https://localhost:8443/api/users/{{adminId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+X-XSRF-TOKEN: {{csrfToken}}
+
+> {%
+    client.test("HTTP 409", () => client.assert(response.status === 409, "Ожидался 409, получен " + response.status));
+%}
+
+### Редактор на месте
+GET https://localhost:8443/api/users/{{editorId}}
+Authorization: Basic {{adminEmail}} {{adminPassword}}
+
+> {%
+    client.test("HTTP 200", () => client.assert(response.status === 200, "Ожидался 200, получен " + response.status));
+%}
